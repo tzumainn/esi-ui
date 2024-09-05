@@ -34,6 +34,82 @@ class ESIJSONView(topology_view.JSONView):
         ]
         return data
 
+    def _get_networks(self, request):
+        # Get neutron data
+        # if we didn't specify tenant_id, all networks shown as admin user.
+        # so it is need to specify the networks. However there is no need to
+        # specify tenant_id for subnet. The subnet which belongs to the public
+        # network is needed to draw subnet information on public network.
+        try:
+            # NOTE(amotoki):
+            # To support auto allocated network in the network topology view,
+            # we need to handle the auto allocated network which haven't been
+            # created yet. The current network topology logic cannot not handle
+            # fake network ID properly, so we temporarily exclude
+            # pre-auto-allocated-network from the network topology view.
+            # It would be nice if someone is interested in supporting it.
+            neutron_networks = api.neutron.network_list_for_tenant(
+                request,
+                request.user.tenant_id,
+                include_pre_auto_allocate=False)
+        except Exception:
+            neutron_networks = []
+        networks = []
+        for network in neutron_networks:
+            allow_delete_subnet = policy.check(
+                (("network", "delete_subnet"),),
+                request,
+                target={'network:tenant_id': getattr(network,
+                                                     'tenant_id', None)}
+            )
+            obj = {'name': network.name_or_id,
+                   'id': network.id,
+                   'subnets': [{'id': subnet.id,
+                                'cidr': subnet.cidr}
+                               for subnet in network.subnets],
+                   'status': self.trans.network[network.status],
+                   'allow_delete_subnet': allow_delete_subnet,
+                   'original_status': network.status,
+                   'router:external': network['is_router_external']}
+            self.add_resource_url('horizon:project:networks:subnets:detail',
+                                  obj['subnets'])
+            networks.append(obj)
+
+        # Add public networks to the networks list
+        if self.is_router_enabled:
+            try:
+                neutron_public_networks = api.neutron.network_list(
+                    request,
+                    **{'router:external': True})
+            except Exception:
+                neutron_public_networks = []
+            my_network_ids = [net['id'] for net in networks]
+            for publicnet in neutron_public_networks:
+                if publicnet.id in my_network_ids:
+                    continue
+                try:
+                    subnets = [{'id': subnet.id,
+                                'cidr': subnet.cidr}
+                               for subnet in publicnet.subnets]
+                    self.add_resource_url(
+                        'horizon:project:networks:subnets:detail', subnets)
+                except Exception:
+                    subnets = []
+                networks.append({
+                    'name': publicnet.name_or_id,
+                    'id': publicnet.id,
+                    'subnets': subnets,
+                    'status': self.trans.network[publicnet.status],
+                    'original_status': publicnet.status,
+                    'router:external': publicnet['is_router_external']})
+
+        self.add_resource_url('horizon:project:networks:detail',
+                              networks)
+
+        return sorted(networks,
+                      key=lambda x: x.get('router:external'),
+                      reverse=True)
+
     def _get_ports(self, request, networks):
         token = request.user.token.id
         try:
